@@ -1,4 +1,4 @@
-use crate::video::Video;
+use crate::video::{Video, ZeroCopyFrame};
 #[cfg(target_os = "macos")]
 use core_foundation::{
     base::TCFType,
@@ -13,7 +13,10 @@ use core_video::r#return::kCVReturnSuccess;
 use gpui::{
     Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Window,
 };
+#[cfg(not(target_os = "macos"))]
+use gpui::{SharedBytes, YuvFormat, YuvFrameData};
 use std::sync::Arc;
+#[cfg(not(target_os = "macos"))]
 use yuv::{YuvBiPlanarImage, YuvConversionMode, YuvRange, YuvStandardMatrix, yuv_nv12_to_bgra};
 
 /// A video element that implements Element trait similar to GPUI's img element
@@ -149,10 +152,13 @@ impl VideoElement {
                 )
                 .ok();
 
-            // Drop the previously uploaded image after painting to avoid atlas growth
-            if let Some(prev) = prev_image {
-                cx.drop_image(prev, Some(window));
-            }
+            // TODO: Dropping the image immediately causes a panic in blade_atlas
+            // See: https://github.com/zed-industries/zed/issues/XXXX
+            // Temporarily disabled to avoid crash - this will cause atlas growth
+            // if let Some(prev) = prev_image {
+            //     cx.drop_image(prev, Some(window));
+            // }
+            let _ = prev_image;
         }
     }
 
@@ -257,7 +263,53 @@ impl VideoElement {
         true
     }
 
-    /// Convert NV12 YUV data to RGB using optimized yuvutils-rs
+    /// Linux/Windows: Paint NV12 YUV data with TRUE zero-copy.
+    /// Uses SharedBytes::from_owner to wrap the GStreamer MappedBuffer directly.
+    /// No allocations or copies - the GStreamer buffer stays mapped.
+    #[cfg(not(target_os = "macos"))]
+    fn try_paint_surface_zero_copy(
+        &self,
+        window: &mut Window,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        frame: ZeroCopyFrame,
+    ) -> bool {
+        let (frame_width, frame_height) = frame.dimensions();
+        let width = frame_width as usize;
+        let height = frame_height as usize;
+        let y_size = width * height;
+        let uv_size = (width * height) / 2;
+
+        if frame.as_slice().len() < y_size + uv_size || width == 0 || height == 0 {
+            return false;
+        }
+
+        // TRUE zero-copy: SharedBytes::from_owner wraps the ZeroCopyFrame
+        // which keeps the GStreamer MappedBuffer alive
+        let shared_data = SharedBytes::from_owner(frame);
+
+        // Zero-copy slicing - just Arc::clone + offset adjustment
+        let y_plane = shared_data.slice(..y_size);
+        let uv_plane = shared_data.slice(y_size..y_size + uv_size);
+
+        let frame_data = YuvFrameData {
+            format: YuvFormat::Nv12,
+            width: frame_width,
+            height: frame_height,
+            y_plane,
+            u_plane: uv_plane,
+            v_plane: None,
+            y_stride: frame_width,
+            u_stride: frame_width,
+            v_stride: None,
+        };
+
+        let dest_bounds = self.fitted_bounds(bounds, frame_width, frame_height);
+        window.paint_surface(dest_bounds, frame_data);
+        true
+    }
+
+    /// Convert NV12 YUV data to RGB using optimized yuvutils-rs (fallback for unsupported platforms)
+    #[cfg(not(target_os = "macos"))]
     fn yuv_to_rgb(&self, yuv_data: &[u8], width: u32, height: u32) -> Vec<u8> {
         let width_usize = width as usize;
         let height_usize = height as usize;
@@ -391,7 +443,7 @@ impl Element for VideoElement {
         window: &mut Window,
         _cx: &mut gpui::App,
     ) -> Self::PrepaintState {
-        // Schedule repaints only when playing or when a new frame arrived.
+        // Schedule repaints while playing to poll for new frames.
         let is_playing = !self.video.eos() && !self.video.paused();
         let has_new_frame = self.video.take_frame_ready();
         if is_playing || has_new_frame {
@@ -409,34 +461,33 @@ impl Element for VideoElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        // Prefer buffered frames if available. Drain to the latest to avoid lag.
-        let buffered = self.video.buffered_len();
-        let mut frame_to_render: Option<(Vec<u8>, u32, u32)> = None;
-        let mut from_buffer = false;
-        if buffered > 0 {
-            for _ in 0..buffered {
-                if let Some(frame) = self.video.pop_buffered_frame() {
-                    frame_to_render = Some(frame);
+        // On macOS, use Vec<u8> path (CVPixelBuffer requires contiguous data)
+        #[cfg(target_os = "macos")]
+        {
+            let buffered = self.video.buffered_len();
+            let mut frame_to_render: Option<(Vec<u8>, u32, u32)> = None;
+            let mut from_buffer = false;
+            if buffered > 0 {
+                for _ in 0..buffered {
+                    if let Some(frame) = self.video.pop_buffered_frame() {
+                        frame_to_render = Some(frame);
+                    }
                 }
-            }
-            from_buffer = frame_to_render.is_some();
-        } else {
-            frame_to_render = self.video.current_frame_data();
-        }
-
-        if let Some((yuv_data, frame_width, frame_height)) = frame_to_render {
-            if from_buffer {
-                log::debug!(
-                    "Painting frame from buffer (buffered_len before drain: {})",
-                    buffered
-                );
+                from_buffer = frame_to_render.is_some();
             } else {
-                log::debug!("Painting frame from live current_frame_data()");
+                frame_to_render = self.video.current_frame_data();
             }
 
-            // On macOS, upload via CVPixelBuffer + paint_surface to avoid atlas growth
-            #[cfg(target_os = "macos")]
-            {
+            if let Some((yuv_data, frame_width, frame_height)) = frame_to_render {
+                if from_buffer {
+                    log::debug!(
+                        "Painting frame from buffer (buffered_len before drain: {})",
+                        buffered
+                    );
+                } else {
+                    log::debug!("Painting frame from live current_frame_data()");
+                }
+
                 if self.try_paint_surface_macos(
                     window,
                     bounds,
@@ -447,9 +498,37 @@ impl Element for VideoElement {
                     return;
                 }
             }
+        }
 
-            let rgb_data = self.yuv_to_rgb(&yuv_data, frame_width, frame_height);
-            self.paint_render_image(window, cx, bounds, rgb_data, frame_width, frame_height);
+        // On Linux/Windows, use TRUE zero-copy GPU rendering
+        // No allocations - GStreamer buffer stays mapped through SharedBytes::from_owner
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Optimized single-lock frame retrieval: drains buffer or falls back to current frame
+            let frame_to_render = self.video.get_frame_for_paint();
+
+            if let Some(frame) = frame_to_render {
+                // Use TRUE zero-copy GPU rendering via paint_surface
+                if self.try_paint_surface_zero_copy(window, bounds, frame) {
+                    return;
+                }
+
+                // Fallback to CPU conversion if GPU rendering fails
+                if let Some(fallback_frame) = self.video.current_frame_zero_copy() {
+                    log::warn!("GPU YUV rendering failed, falling back to CPU conversion");
+                    let (frame_width, frame_height) = fallback_frame.dimensions();
+                    let rgb_data =
+                        self.yuv_to_rgb(fallback_frame.as_slice(), frame_width, frame_height);
+                    self.paint_render_image(
+                        window,
+                        cx,
+                        bounds,
+                        rgb_data,
+                        frame_width,
+                        frame_height,
+                    );
+                }
+            }
         }
     }
 }

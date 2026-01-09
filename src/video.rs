@@ -1,10 +1,10 @@
 use crate::Error;
+use gst::buffer::{MappedBuffer, Readable};
+use gst::message::MessageView;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer_app::prelude::*;
 use gstreamer_video as gst_video;
-// Note: GPUI imports removed since we're using simple Vec<u8> for RGBA data
-use gst::message::MessageView;
 use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -45,12 +45,55 @@ impl From<u64> for Position {
 pub(crate) struct Frame(gst::Sample);
 
 impl Frame {
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self(gst::Sample::builder().build())
     }
 
-    pub fn readable(&'_ self) -> Option<gst::BufferMap<'_, gst::buffer::Readable>> {
+    pub(crate) fn readable(&'_ self) -> Option<gst::BufferMap<'_, gst::buffer::Readable>> {
         self.0.buffer().and_then(|x| x.map_readable().ok())
+    }
+}
+
+/// Zero-copy frame data backed by GStreamer's mapped buffer.
+/// Keeps the GStreamer buffer memory-mapped and alive without copying.
+#[derive(Clone)]
+pub struct ZeroCopyFrame {
+    mapped: Arc<MappedBuffer<Readable>>,
+    width: u32,
+    height: u32,
+}
+
+impl ZeroCopyFrame {
+    /// Create a zero-copy frame from a GStreamer sample.
+    /// Uses buffer_owned() (refcount bump) + into_mapped_buffer_readable() (memory map).
+    /// No data is copied - O(1) operation.
+    pub fn new(sample: &gst::Sample, width: u32, height: u32) -> Option<Self> {
+        // buffer_owned() bumps refcount only - O(1), no data copy
+        let buffer = sample.buffer_owned()?;
+        // into_mapped_buffer_readable() maps memory - O(1), no data copy
+        let mapped = buffer.into_mapped_buffer_readable().ok()?;
+        Some(Self {
+            mapped: Arc::new(mapped),
+            width,
+            height,
+        })
+    }
+
+    /// Get the raw frame data as a slice.
+    pub fn as_slice(&self) -> &[u8] {
+        self.mapped.as_slice()
+    }
+
+    /// Get frame dimensions (width, height).
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
+
+// Implement AsRef<[u8]> for SharedBytes::from_owner() integration
+impl AsRef<[u8]> for ZeroCopyFrame {
+    fn as_ref(&self) -> &[u8] {
+        self.mapped.as_slice()
     }
 }
 
@@ -324,9 +367,8 @@ impl Video {
         let framerate = cleanup!(s.get::<gst::Fraction>("framerate").map_err(|_| Error::Caps))?;
         let framerate = framerate.numer() as f64 / framerate.denom() as f64;
 
-        // Obtain video info from caps for NV12 format
-        let vinfo = cleanup!(gst_video::VideoInfo::from_caps(&caps).map_err(|_| Error::Caps))?;
-        let _row_stride0 = vinfo.stride()[0] as usize;
+        // Validate video info from caps
+        let _vinfo = cleanup!(gst_video::VideoInfo::from_caps(&caps).map_err(|_| Error::Caps))?;
 
         if framerate.is_nan()
             || framerate.is_infinite()
@@ -603,7 +645,8 @@ impl Video {
 
     /// Get the size/resolution of the video as `(width, height)`.
     pub fn size(&self) -> (i32, i32) {
-        (self.read().width, self.read().height)
+        let inner = self.read();
+        (inner.width, inner.height)
     }
 
     /// Get the natural aspect ratio (width / height) of the video as f32.
@@ -819,5 +862,40 @@ impl Video {
     /// Number of frames currently buffered.
     pub fn buffered_len(&self) -> usize {
         self.read().frame_buffer.lock().len()
+    }
+
+    /// Get current frame as true zero-copy wrapper.
+    /// No allocation or copying - keeps GStreamer buffer mapped.
+    pub fn current_frame_zero_copy(&self) -> Option<ZeroCopyFrame> {
+        let inner = self.read();
+        let frame = inner.frame.lock();
+        ZeroCopyFrame::new(&frame.0, inner.width as u32, inner.height as u32)
+    }
+
+    /// Get the best available frame for painting with minimal lock acquisitions.
+    /// Tries buffer first (drains to latest), falls back to current frame.
+    /// Optimized for the paint path - single read lock, minimal mutex time.
+    pub fn get_frame_for_paint(&self) -> Option<ZeroCopyFrame> {
+        let inner = self.read();
+        let width = inner.width as u32;
+        let height = inner.height as u32;
+
+        // Try buffer first - drain all and take latest
+        {
+            let mut buf = inner.frame_buffer.lock();
+            if !buf.is_empty() {
+                let mut latest = None;
+                while let Some(frame) = buf.pop_front() {
+                    latest = Some(frame);
+                }
+                if let Some(frame) = latest {
+                    return ZeroCopyFrame::new(&frame.0, width, height);
+                }
+            }
+        }
+
+        // Fall back to current frame
+        let frame = inner.frame.lock();
+        ZeroCopyFrame::new(&frame.0, width, height)
     }
 }

@@ -76,7 +76,7 @@ mod video;
 
 pub use element::{VideoElement, video};
 pub use error::Error;
-pub use video::{Position, Video, VideoOptions};
+pub use video::{Position, Video, VideoOptions, ZeroCopyFrame};
 
 // Re-export commonly used types
 pub use gstreamer as gst;

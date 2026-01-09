@@ -14,7 +14,7 @@ categories = ["multimedia"]
 documentation = "https://docs.rs/gpui-video-player"
 
 [dependencies]
-gpui = "0.2"
+gpui = "0.2.2"
 gstreamer = "0.24"
 gstreamer-app = "0.24" # appsink
 gstreamer-base = "0.24" # basesrc
@@ -34,4 +34,20 @@ core-foundation = "0.10"
 
 [dev-dependencies]
 env_logger = "0.11"
-gpui-component = "0.2"
+# gpui-component = "0.5" # Temporarily disabled - incompatible with gpui git
+
+# Workaround for zvariant_derive 5.9.0 breaking change that broke ashpd and other crates
+# See: https://github.com/dbus2/zbus/issues/1665
+# See: https://github.com/bilelmoussaoui/ashpd/issues/323
+# Pin to zvariant-5.8.0 tag until the issue is resolved upstream
+[patch.crates-io]
+zbus = { git = "https://github.com/dbus2/zbus.git", tag = "zvariant-5.8.0" }
+zbus_macros = { git = "https://github.com/dbus2/zbus.git", tag = "zvariant-5.8.0" }
+zbus_names = { git = "https://github.com/dbus2/zbus.git", tag = "zvariant-5.8.0" }
+zvariant = { git = "https://github.com/dbus2/zbus.git", tag = "zvariant-5.8.0" }
+zvariant_derive = { git = "https://github.com/dbus2/zbus.git", tag = "zvariant-5.8.0" }
+zvariant_utils = { git = "https://github.com/dbus2/zbus.git", tag = "zvariant-5.8.0" }
+
+# Use gpui with YUV surface support for Linux/Windows
+gpui = { git = "https://github.com/jlucaso1/zed.git", branch = "gpui-yuv-surface-linux-windows", package = "gpui" }
+
