@@ -51,3 +51,11 @@ zvariant_utils = { git = "https://github.com/dbus2/zbus.git", tag = "zvariant-5.
 # Use gpui with YUV surface support for Linux/Windows
 gpui = { git = "https://github.com/jlucaso1/zed.git", branch = "gpui-yuv-surface-linux-windows", package = "gpui" }
 
+[profile.release]
+opt-level = "z"
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
